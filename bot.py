@@ -3,7 +3,7 @@
 
 Что делает:
   1. За PREP_MINUTES до каждого слота публикации берёт свежие новости из RSS,
-     просит GigaChat написать пост по рубрике и подбирает фото на Pixabay.
+     просит GigaChat написать пост по рубрике и рисует картинку через Kandinsky (или берёт фото с Pixabay).
   2. Отправляет черновик всем админам в личку с кнопками модерации.
   3. После одобрения публикует пост в канал в своё время (или сразу).
 
@@ -57,6 +57,8 @@ GIGACHAT_MODEL = env("GIGACHAT_MODEL", "GigaChat-2-Pro")
 
 PIXABAY_KEY = env("PIXABAY_API_KEY")   # pixabay.com/api/docs — бесплатно
 PEXELS_KEY = env("PEXELS_API_KEY")     # необязательно, если есть ключ
+# Откуда брать картинки, по порядку: kandinsky (рисует GigaChat), pixabay, pexels
+IMAGE_SOURCES = [x.strip().lower() for x in env("IMAGE_SOURCES", "kandinsky,pixabay").split(",") if x.strip()]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Папка data/ на хостингах обычно сохраняется между перезапусками
@@ -259,7 +261,30 @@ class MaxApi:
         body = {"text": text[:4000], "format": "markdown"}
         if attachments:
             body["attachments"] = attachments
-        return self.call("POST", "/messages", params=params, body=body)
+        for attempt in range(6):
+            try:
+                return self.call("POST", "/messages", params=params, body=body)
+            except RuntimeError as e:
+                # свежезагруженная картинка ещё обрабатывается — ждём и повторяем
+                if "attachment.not.ready" not in str(e) or attempt == 5:
+                    raise
+                time.sleep(2 + attempt * 2)
+
+    def upload_image(self, data, filename="image.jpg"):
+        """Загружает картинку в MAX и возвращает токен для вложения."""
+        up = self.call("POST", "/uploads", params={"type": "image"})
+        r = self.s.post(up["url"], files={"data": (filename, data, "image/jpeg")}, timeout=90)
+        r.raise_for_status()
+        try:
+            j = r.json()
+        except ValueError:
+            j = {}
+        token = j.get("token") or next(
+            (v.get("token") for v in (j.get("photos") or {}).values() if isinstance(v, dict) and v.get("token")),
+            None) or up.get("token")
+        if not token:
+            raise RuntimeError(f"MAX не вернул токен картинки: {r.text[:200]}")
+        return token
 
     def answer(self, callback_id, text, attachments):
         """Меняет сообщение, на кнопку которого нажали. attachments=[] убирает вложения."""
@@ -277,8 +302,11 @@ class MaxApi:
 mx = MaxApi()
 
 
-def image_att(url):
-    return {"type": "image", "payload": {"url": url}}
+def image_att(img):
+    # «token:…» — картинка, загруженная в MAX; иначе — ссылка на картинку
+    if img.startswith("token:"):
+        return {"type": "image", "payload": {"token": img[6:]}}
+    return {"type": "image", "payload": {"url": img}}
 
 
 def keyboard(rows):
@@ -322,6 +350,33 @@ class GigaChat:
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
 
+    def draw(self, description):
+        """Рисует картинку через Kandinsky (встроен в GigaChat), возвращает байты JPG."""
+        if not GIGACHAT_KEY:
+            return None
+        if time.time() > self.exp:
+            self._auth()
+        r = requests.post(self.CHAT, headers={"Authorization": f"Bearer {self.token}"}, json={
+            "model": GIGACHAT_MODEL,
+            "messages": [
+                {"role": "system", "content": "Ты — фотограф и иллюстратор. Рисуешь картинки для постов о бизнесе."},
+                {"role": "user", "content": f"Нарисуй реалистичную фотографию для поста: {description}. "
+                                            "Горизонтальный кадр, без текста, надписей и логотипов."},
+            ],
+            "function_call": "auto",
+        }, verify=CA_BUNDLE, timeout=180)
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"].get("content") or ""
+        m = re.search(r'<img[^>]+src="([^"]+)"', content)
+        if not m:
+            log.warning("Kandinsky не нарисовал картинку: %s", content[:150])
+            return None
+        f = requests.get(f"https://gigachat.devices.sberbank.ru/api/v1/files/{m.group(1)}/content",
+                         headers={"Authorization": f"Bearer {self.token}", "Accept": "application/jpg"},
+                         verify=CA_BUNDLE, timeout=90)
+        f.raise_for_status()
+        return f.content
+
 
 giga = GigaChat()
 
@@ -356,7 +411,7 @@ def _pixabay(query):
     r = requests.get("https://pixabay.com/api/", params={
         "key": PIXABAY_KEY, "q": query, "image_type": "photo",
         "orientation": "horizontal", "safesearch": "true", "per_page": 30,
-    }, timeout=20)
+    }, timeout=8)
     r.raise_for_status()
     return [h["largeImageURL"] for h in r.json().get("hits", []) if h.get("largeImageURL")]
 
@@ -365,20 +420,22 @@ def _pexels(query):
     r = requests.get("https://api.pexels.com/v1/search",
                      headers={"Authorization": PEXELS_KEY},
                      params={"query": query, "per_page": 20, "orientation": "landscape"},
-                     timeout=20)
+                     timeout=8)
     r.raise_for_status()
     return [p["src"]["large"] for p in r.json().get("photos", [])]
 
 
-def find_image(query, exclude=None):
+def stock_image(query, exclude=None, sources=("pixabay", "pexels")):
     if not query:
         return None
-    sources = [(n, f) for n, f, key in (("Pixabay", _pixabay, PIXABAY_KEY),
-                                        ("Pexels", _pexels, PEXELS_KEY)) if key]
+    fns = {"pixabay": (_pixabay, PIXABAY_KEY), "pexels": (_pexels, PEXELS_KEY)}
     # если по точному запросу ничего нет — пробуем по первым словам
     words = query.split()
     queries = [query] + ([" ".join(words[:2])] if len(words) > 2 else [])
-    for name, fn in sources:
+    for name in sources:
+        fn, key = fns[name]
+        if not key:
+            continue
         for qq in queries:
             try:
                 photos = fn(qq)
@@ -389,6 +446,25 @@ def find_image(query, exclude=None):
             if photos:
                 return random.choice(photos)
     return None
+
+
+def make_image(text, photo_query, exclude=None):
+    """Возвращает картинку для поста: «token:…» (загружена в MAX), ссылку или None."""
+    title = re.sub(r"[*_#]", "", (text or "").strip().split("\n", 1)[0])[:150]
+    for src in IMAGE_SOURCES:
+        try:
+            if src == "kandinsky":
+                data = giga.draw(f"{title}. Ключевые слова: {photo_query}")
+                if data:
+                    return "token:" + mx.upload_image(data)
+            elif src in ("pixabay", "pexels"):
+                url = stock_image(photo_query, exclude, sources=(src,))
+                if url:
+                    return url
+        except Exception as e:  # noqa: BLE001
+            log.warning("Картинка (%s): %s", src, e)
+    return None
+
 
 # ─────────────────────────── Генерация поста ───────────────────────────
 
@@ -406,12 +482,15 @@ def parse_answer(raw):
 REFUSAL_MARKERS = (
     "не обладает собственным мнением", "не транслирует мнение", "что-то в вашем вопросе меня смущает",
     "как и любая языковая модель", "не могу ответить на этот вопрос", "давайте поговорим о чём-нибудь другом",
-    "разговоры на чувствительные темы", "не могу помочь с этим",
+    "разговоры на чувствительные темы", "не могу помочь с этим", "генеративные языковые модели",
+    "чувствительными темами", "временно ограничены", "благодарим за понимание",
 )
 
 
-def is_refusal(raw):
+def is_refusal(raw, need_format=False):
     low = raw.lower()
+    if need_format and not ("---" in raw and "фото:" in low):
+        return True  # модель не следовала формату — почти всегда это заглушка-отказ
     return any(m in low for m in REFUSAL_MARKERS) or len(raw.strip()) < 200
 
 
@@ -438,7 +517,7 @@ def generate(rubric_idx):
     attempts = [all_news[:8], all_news[8:15], []] if all_news else [[], []]
     for news in attempts:
         raw = giga.chat(SYSTEM_PROMPT, build_prompt(name, task, news, recent))
-        if is_refusal(raw):
+        if is_refusal(raw, need_format=True):
             log.warning("GigaChat отказался писать пост, пробую по-другому: %s", raw[:120])
             continue
         src, photo_query, text = parse_answer(raw)
@@ -448,7 +527,7 @@ def generate(rubric_idx):
         if source:
             q("INSERT OR IGNORE INTO seen_news (link, at) VALUES (?,?)", (source["link"], now().isoformat()))
         return {"text": text, "photo_query": photo_query,
-                "image_url": find_image(photo_query),
+                "image_url": make_image(text, photo_query),
                 "source_url": source["link"] if source else None}
     raise RuntimeError("GigaChat несколько раз отказался писать пост. Попробуйте /new ещё раз позже.")
 
@@ -538,7 +617,13 @@ def on_callback(u):
         if at < now() - timedelta(minutes=1):
             at = now()
         update_post(p["id"], status="approved", publish_at=at.isoformat())
-        mx.answer(cid, card(p, f"✅ Одобрено, выйдет в {at:%H:%M} (№{p['id']})"), atts(p, with_kb=False))
+        mx.answer(cid, card(p, f"✅ Одобрено, выйдет в {at:%H:%M} (№{p['id']})"),
+                  atts(p, with_kb=False) + [keyboard([[("↩️ Отменить", f"undo:{p['id']}")]])])
+
+    elif action == "undo":
+        update_post(p["id"], status="pending", publish_at=None)
+        p = get_post(p["id"])
+        mx.answer(cid, card(p, f"↩️ Одобрение отменено — черновик №{p['id']}"), atts(p))
 
     elif action == "now":
         mx.answer(cid, card(p, f"⏳ Публикую №{p['id']}…"), atts(p, with_kb=False))
@@ -561,10 +646,15 @@ def on_callback(u):
         in_background(job)
 
     elif action == "photo":
-        new = find_image(p["photo_query"], exclude=p["image_url"])
-        update_post(p["id"], image_url=new or p["image_url"])
-        p = get_post(p["id"])
-        mx.answer(cid, card(p), atts(p))
+        mx.answer(cid, card(p, f"⏳ Подбираю новую картинку для №{p['id']}…"), atts(p, with_kb=False))
+
+        def job():
+            new = make_image(p["text"], p["photo_query"], exclude=p["image_url"])
+            if not new:
+                mx.send("⚠️ Не получилось сделать новую картинку, оставил прежнюю.", user_id=uid)
+            update_post(p["id"], image_url=new or p["image_url"])
+            send_card(get_post(p["id"]), [uid])
+        in_background(job)
 
     elif action == "edit":
         edit_wait[uid] = p["id"]
@@ -582,6 +672,7 @@ HELP = ("Команды:\n"
         "/new 3 — черновик конкретной рубрики (1–5)\n"
         "/queue — что ждёт модерации и публикации\n"
         "/chats — ID каналов, где состоит бот\n"
+        "/del 3 — удалить пост №3 из очереди (даже одобренный)\n"
         "/cancel — отменить правку текста\n\n"
         "Рубрики:\n" + "\n".join(f"{i}. {r[0]}" for i, r in enumerate(RUBRICS, 1)))
 
@@ -652,6 +743,14 @@ def on_message(u):
         else:
             mx.send("Пока не видел ни одного канала. Добавьте бота администратором канала "
                     "и опубликуйте там любой пост — бот пришлёт ID.", user_id=uid)
+    elif re.fullmatch(r"/del\s+\d+", text):
+        pid = int(text.split()[1])
+        p = get_post(pid)
+        if not p or p["status"] in ("published", "deleted"):
+            mx.send(f"Пост №{pid} не найден или уже опубликован/удалён.", user_id=uid)
+        else:
+            update_post(pid, status="deleted")
+            mx.send(f"🗑 Пост №{pid} удалён, в канал он не выйдет.", user_id=uid)
     elif text == "/queue":
         rows = q("SELECT * FROM posts WHERE status IN ('pending','approved') ORDER BY id")
         if not rows:
