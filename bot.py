@@ -499,6 +499,8 @@ def create_draft(slot_key, slot_time, rubric_idx):
 
 
 def publish(p):
+    if not CHANNEL_ID:
+        raise RuntimeError("не задан CHANNEL_ID. Опубликуйте пост в канале — бот пришлёт его ID")
     mx.send(p["text"], chat_id=CHANNEL_ID, attachments=atts(p, with_kb=False) or None)
     update_post(p["id"], status="published")
     log.info("Пост №%s опубликован", p["id"])
