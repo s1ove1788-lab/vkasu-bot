@@ -1,4 +1,4 @@
-"""
+""
 Бот-автопостер для канала «Идея в кассу» в мессенджере MAX.
 
 Что делает:
@@ -35,15 +35,21 @@ log = logging.getLogger("vkasu")
 # ─────────────────────────── Настройки ───────────────────────────
 
 def env(name, default=None, required=False):
-    val = os.getenv(name, default)
+    val = (os.getenv(name) or "").strip() or default  # пустая переменная = не задана
     if required and not val:
         sys.exit(f"Не задана переменная {name} в файле .env")
     return val
 
 MAX_API = env("MAX_API_URL", "https://platform-api2.max.ru").rstrip("/")
 MAX_TOKEN = env("MAX_TOKEN", required=True)
-CHANNEL_ID = int(env("CHANNEL_ID", "0"))
-ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", env("ADMIN_IDS", "")) if x.strip()}
+_ch = env("CHANNEL_ID", "0")
+if not re.fullmatch(r"-?\d+", _ch):
+    sys.exit(f"CHANNEL_ID должен быть числом, например -123456789, а сейчас: {_ch!r}")
+CHANNEL_ID = int(_ch)
+_bad = [x for x in re.split(r"[,\s]+", env("ADMIN_IDS", "")) if x and not x.isdigit()]
+if _bad:
+    sys.exit(f"ADMIN_IDS — только числа через запятую. Непонятно: {', '.join(_bad)}")
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", env("ADMIN_IDS", "")) if x}
 
 GIGACHAT_KEY = env("GIGACHAT_AUTH_KEY")
 GIGACHAT_SCOPE = env("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
