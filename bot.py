@@ -3,7 +3,7 @@
 
 Что делает:
   1. За PREP_MINUTES до каждого слота публикации берёт свежие новости из RSS,
-     просит GigaChat написать пост по рубрике и подбирает фото на Pexels.
+     просит GigaChat написать пост по рубрике и подбирает фото на Pixabay.
   2. Отправляет черновик всем админам в личку с кнопками модерации.
   3. После одобрения публикует пост в канал в своё время (или сразу).
 
@@ -49,7 +49,8 @@ GIGACHAT_KEY = env("GIGACHAT_AUTH_KEY")
 GIGACHAT_SCOPE = env("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_MODEL = env("GIGACHAT_MODEL", "GigaChat-2-Pro")
 
-PEXELS_KEY = env("PEXELS_API_KEY")
+PIXABAY_KEY = env("PIXABAY_API_KEY")   # pixabay.com/api/docs — бесплатно
+PEXELS_KEY = env("PEXELS_API_KEY")     # необязательно, если есть ключ
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Папка data/ на хостингах обычно сохраняется между перезапусками
@@ -333,21 +334,43 @@ def fresh_news(limit=15):
     return items[:limit]
 
 
+def _pixabay(query):
+    r = requests.get("https://pixabay.com/api/", params={
+        "key": PIXABAY_KEY, "q": query, "image_type": "photo",
+        "orientation": "horizontal", "safesearch": "true", "per_page": 30,
+    }, timeout=20)
+    r.raise_for_status()
+    return [h["largeImageURL"] for h in r.json().get("hits", []) if h.get("largeImageURL")]
+
+
+def _pexels(query):
+    r = requests.get("https://api.pexels.com/v1/search",
+                     headers={"Authorization": PEXELS_KEY},
+                     params={"query": query, "per_page": 20, "orientation": "landscape"},
+                     timeout=20)
+    r.raise_for_status()
+    return [p["src"]["large"] for p in r.json().get("photos", [])]
+
+
 def find_image(query, exclude=None):
-    if not PEXELS_KEY or not query:
+    if not query:
         return None
-    try:
-        r = requests.get("https://api.pexels.com/v1/search",
-                         headers={"Authorization": PEXELS_KEY},
-                         params={"query": query, "per_page": 20, "orientation": "landscape"},
-                         timeout=20)
-        r.raise_for_status()
-        photos = [p["src"]["large"] for p in r.json().get("photos", [])]
-        photos = [p for p in photos if p != exclude] or photos
-        return random.choice(photos) if photos else None
-    except Exception as e:  # noqa: BLE001
-        log.warning("Pexels: %s", e)
-        return None
+    sources = [(n, f) for n, f, key in (("Pixabay", _pixabay, PIXABAY_KEY),
+                                        ("Pexels", _pexels, PEXELS_KEY)) if key]
+    # если по точному запросу ничего нет — пробуем по первым словам
+    words = query.split()
+    queries = [query] + ([" ".join(words[:2])] if len(words) > 2 else [])
+    for name, fn in sources:
+        for qq in queries:
+            try:
+                photos = fn(qq)
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s: %s", name, e)
+                break
+            photos = [p for p in photos if p != exclude] or photos
+            if photos:
+                return random.choice(photos)
+    return None
 
 # ─────────────────────────── Генерация поста ───────────────────────────
 
@@ -607,8 +630,18 @@ def scheduler_loop():
 
 def main():
     init_db()
+    try:
+        chats = mx.call("GET", "/chats").get("chats", [])
+        log.info("Чаты и каналы, где состоит бот:")
+        for c in chats:
+            log.info("  CHANNEL_ID=%s  (%s) %s", c.get("chat_id"), c.get("type"), c.get("title"))
+        if not chats:
+            log.warning("  пусто — добавьте бота администратором канала и перезапустите")
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось получить список чатов: %s", e)
     if not CHANNEL_ID:
-        sys.exit("Не задан CHANNEL_ID. Узнайте его командой: python bot.py chats")
+        log.warning("CHANNEL_ID не задан: черновики будут приходить, но публикация не сработает. "
+                    "Возьмите ID канала из списка выше.")
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS пуст: напишите боту в личку — он ответит вашим ID")
 
