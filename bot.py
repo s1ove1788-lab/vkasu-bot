@@ -28,9 +28,12 @@ import requests
 import feedparser
 from dotenv import load_dotenv
 
+VERSION = "31.10-v7"  # видно в первой строке лога
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vkasu")
+log.info("Бот «Идея в кассу», версия %s", VERSION)
 
 # ─────────────────────────── Настройки ───────────────────────────
 
