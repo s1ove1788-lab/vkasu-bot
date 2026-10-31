@@ -255,6 +255,7 @@ class MaxApi:
 
     def send(self, text, chat_id=None, user_id=None, attachments=None):
         params = {"chat_id": chat_id} if chat_id else {"user_id": user_id}
+        params["disable_link_preview"] = "true"
         body = {"text": text[:4000], "format": "markdown"}
         if attachments:
             body["attachments"] = attachments
@@ -263,7 +264,8 @@ class MaxApi:
     def answer(self, callback_id, text, attachments):
         """Меняет сообщение, на кнопку которого нажали. attachments=[] убирает вложения."""
         body = {"message": {"text": text[:4000], "format": "markdown", "attachments": attachments}}
-        return self.call("POST", "/answers", params={"callback_id": callback_id}, body=body)
+        return self.call("POST", "/answers", params={"callback_id": callback_id,
+                                                    "disable_link_preview": "true"}, body=body)
 
     def updates(self, marker):
         params = {"timeout": 25}
@@ -401,27 +403,54 @@ def parse_answer(raw):
             text.strip())
 
 
-def generate(rubric_idx):
-    name, task = RUBRICS[rubric_idx]
-    news = fresh_news()
-    recent = [r["text"].split("\n", 1)[0][:100] for r in
-              q("SELECT text FROM posts WHERE status!='deleted' ORDER BY id DESC LIMIT 40")]
+REFUSAL_MARKERS = (
+    "не обладает собственным мнением", "не транслирует мнение", "что-то в вашем вопросе меня смущает",
+    "как и любая языковая модель", "не могу ответить на этот вопрос", "давайте поговорим о чём-нибудь другом",
+    "разговоры на чувствительные темы", "не могу помочь с этим",
+)
 
+
+def is_refusal(raw):
+    low = raw.lower()
+    return any(m in low for m in REFUSAL_MARKERS) or len(raw.strip()) < 200
+
+
+def build_prompt(name, task, news, recent):
     parts = [f"Рубрика: {name}. Задача: {task}."]
     if news:
-        parts.append("Свежие новости — выбери одну как повод для идеи, если подходит:")
+        parts.append("Свежие новости — выбери одну как повод для идеи, если подходит. "
+                     "Политику, происшествия и острые темы не бери:")
         parts += [f"{i}. {n['title']} — {n['summary']}" for i, n in enumerate(news, 1)]
     if recent:
         parts.append("Эти темы уже были, не повторяйся:\n" + "\n".join(f"- {t}" for t in recent))
     parts.append(POST_FORMAT)
+    return "\n\n".join(parts)
 
-    src, photo_query, text = parse_answer(giga.chat(SYSTEM_PROMPT, "\n\n".join(parts)))
-    source = news[src - 1] if 0 < src <= len(news) else None
-    if source:
-        q("INSERT OR IGNORE INTO seen_news (link, at) VALUES (?,?)", (source["link"], now().isoformat()))
-    return {"text": text, "photo_query": photo_query,
-            "image_url": find_image(photo_query),
-            "source_url": source["link"] if source else None}
+
+def generate(rubric_idx):
+    name, task = RUBRICS[rubric_idx]
+    all_news = fresh_news()
+    recent = [r["text"].split("\n", 1)[0][:100] for r in
+              q("SELECT text FROM posts WHERE status!='deleted' ORDER BY id DESC LIMIT 40")]
+
+    # GigaChat иногда отказывается из-за «острой» новости — тогда пробуем с другими новостями,
+    # а в последний раз вообще без новостей
+    attempts = [all_news[:8], all_news[8:15], []] if all_news else [[], []]
+    for news in attempts:
+        raw = giga.chat(SYSTEM_PROMPT, build_prompt(name, task, news, recent))
+        if is_refusal(raw):
+            log.warning("GigaChat отказался писать пост, пробую по-другому: %s", raw[:120])
+            continue
+        src, photo_query, text = parse_answer(raw)
+        if is_refusal(text):
+            continue
+        source = news[src - 1] if 0 < src <= len(news) else None
+        if source:
+            q("INSERT OR IGNORE INTO seen_news (link, at) VALUES (?,?)", (source["link"], now().isoformat()))
+        return {"text": text, "photo_query": photo_query,
+                "image_url": find_image(photo_query),
+                "source_url": source["link"] if source else None}
+    raise RuntimeError("GigaChat несколько раз отказался писать пост. Попробуйте /new ещё раз позже.")
 
 # ─────────────────────────── Модерация ───────────────────────────
 
@@ -639,6 +668,9 @@ def on_message(u):
 # ─────────────────────────── Планировщик ───────────────────────────
 
 
+failed_slots = {}  # слот → время последней неудачной попытки
+
+
 def scheduler_tick():
     t = now()
     # 1) Готовим черновики к слотам
@@ -647,14 +679,20 @@ def scheduler_tick():
         if at - timedelta(minutes=PREP_MINUTES) <= t < at:
             key = f"{t:%Y-%m-%d} {hhmm}"
             if not q("SELECT 1 FROM posts WHERE slot_key=?", (key,), one=True):
+                last = failed_slots.get(key)
+                if last and (t - last).total_seconds() < 600:
+                    continue  # после неудачи пробуем снова не чаще раза в 10 минут
                 rubric = (i + t.weekday()) % len(RUBRICS)
                 try:
                     create_draft(key, hhmm, rubric)
                 except Exception as e:  # noqa: BLE001
+                    first_fail = key not in failed_slots
+                    failed_slots[key] = t
                     log.error("Не удалось подготовить слот %s: %s", key, e)
-                    for uid in ADMIN_IDS:
+                    for uid in (ADMIN_IDS if first_fail else ()):
                         try:
-                            mx.send(f"⚠️ Не получилось подготовить пост на {hhmm}: {e}", user_id=uid)
+                            mx.send(f"⚠️ Не получилось подготовить пост на {hhmm}: {e}\n"
+                                    "Попробую ещё раз через 10 минут.", user_id=uid)
                         except Exception:  # noqa: BLE001
                             pass
     # 2) Публикуем одобренные
