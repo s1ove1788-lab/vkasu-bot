@@ -29,6 +29,8 @@ import feedparser
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("vkasu")
 
 # ─────────────────────────── Настройки ───────────────────────────
 
@@ -49,9 +51,46 @@ GIGACHAT_MODEL = env("GIGACHAT_MODEL", "GigaChat-2-Pro")
 
 PEXELS_KEY = env("PEXELS_API_KEY")
 
-# Сертификат «Минцифры» (Russian Trusted Root CA) нужен для GigaChat и API MAX.
-# Укажите путь к .crt/.pem; если пусто — используется системное хранилище.
-CA_BUNDLE = env("CA_BUNDLE") or True
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Папка data/ на хостингах обычно сохраняется между перезапусками
+DATA_DIR = os.path.join(BASE_DIR, "data") if os.path.isdir(os.path.join(BASE_DIR, "data")) else BASE_DIR
+
+
+def build_ca_bundle():
+    """Сертификат Минцифры (Russian Trusted Root CA) нужен для GigaChat и API MAX.
+
+    Достаточно положить файл(ы) сертификата рядом с bot.py или в data/ — с любым
+    именем, содержащим «russian» (.cer, .crt или .pem, текстовый или двоичный).
+    Бот сам склеит их со стандартными сертификатами. CA_BUNDLE в .env — для ручного пути.
+    """
+    explicit = os.getenv("CA_BUNDLE")
+    if explicit:
+        return explicit
+    found = []
+    for folder in {BASE_DIR, DATA_DIR}:
+        for name in sorted(os.listdir(folder)):
+            if re.search(r"russian.*\.(cer|crt|pem)$", name, re.I):
+                found.append(os.path.join(folder, name))
+    if not found:
+        return True
+    import ssl
+    import certifi
+    with open(certifi.where(), encoding="utf-8") as f:
+        bundle = f.read()
+    for path in found:
+        with open(path, "rb") as f:
+            raw = f.read()
+        pem = raw.decode("utf-8", "ignore") if b"BEGIN CERTIFICATE" in raw else ssl.DER_cert_to_PEM_cert(raw)
+        bundle += "\n" + pem.strip() + "\n"
+    out = os.path.join(DATA_DIR, "ca_bundle_combined.pem")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(bundle)
+    logging.getLogger("vkasu").info("Сертификаты Минцифры подключены: %s",
+                                    ", ".join(os.path.basename(p) for p in found))
+    return out
+
+
+CA_BUNDLE = build_ca_bundle()
 
 TZ = ZoneInfo(env("TIMEZONE", "Europe/Moscow"))
 SLOTS = [s.strip() for s in env("SLOTS", "08:30,11:30,14:30,17:30,20:30").split(",") if s.strip()]
@@ -62,10 +101,8 @@ RSS_FEEDS = [u.strip() for u in env(
     "https://rssexport.rbc.ru/rbcnews/news/30/full.rss,https://vc.ru/rss/all",
 ).split(",") if u.strip()]
 
-DB_PATH = env("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db"))
+DB_PATH = env("DB_PATH", os.path.join(DATA_DIR, "bot.db"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("vkasu")
 
 # ─────────────────────────── Рубрики и стиль ───────────────────────────
 
