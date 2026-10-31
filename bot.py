@@ -1,4 +1,4 @@
-""
+"""
 Бот-автопостер для канала «Идея в кассу» в мессенджере MAX.
 
 Что делает:
@@ -87,6 +87,14 @@ def build_ca_bundle():
     for path in found:
         with open(path, "rb") as f:
             raw = f.read()
+        if b"BEGIN CERTIFICATE" not in raw and not raw.startswith(b"\x30"):
+            # файл мог быть сохранён хостингом в base64 — пробуем расшифровать
+            import base64
+            try:
+                raw = base64.b64decode(b"".join(raw.split()), validate=True)
+            except Exception:  # noqa: BLE001
+                log.warning("Не удалось прочитать сертификат %s", path)
+                continue
         pem = raw.decode("utf-8", "ignore") if b"BEGIN CERTIFICATE" in raw else ssl.DER_cert_to_PEM_cert(raw)
         bundle += "\n" + pem.strip() + "\n"
     out = os.path.join(DATA_DIR, "ca_bundle_combined.pem")
