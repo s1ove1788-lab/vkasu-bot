@@ -8,7 +8,7 @@
   3. После одобрения публикует пост в канал в своё время (или сразу).
 
 Запуск:            python bot.py
-Узнать ID канала:  python bot.py chats
+Узнать ID канала:  опубликуйте пост в канале — бот пришлёт ID админам
 Тестовый пост:     python bot.py test   (сгенерирует и пришлёт черновик админам)
 """
 
@@ -555,10 +555,34 @@ HELP = ("Команды:\n"
         "Рубрики:\n" + "\n".join(f"{i}. {r[0]}" for i, r in enumerate(RUBRICS, 1)))
 
 
+known_chats = {}  # chat_id → описание, чтобы сообщать ID канала один раз
+
+
+def report_chat(chat_id, kind):
+    if not chat_id or chat_id in known_chats or chat_id == CHANNEL_ID:
+        return
+    title = ""
+    try:
+        title = mx.call("GET", f"/chats/{chat_id}").get("title") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    known_chats[chat_id] = f"{title or 'без названия'} ({kind or 'чат'})"
+    log.info("Вижу канал/чат %s: CHANNEL_ID=%s", known_chats[chat_id], chat_id)
+    for a in ADMIN_IDS:
+        try:
+            mx.send(f"Вижу канал/чат «{title or 'без названия'}». Его ID: `{chat_id}`\n"
+                    "Если это «Идея в кассу», впишите число в CHANNEL_ID и перезапустите бота.",
+                    user_id=a)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def on_message(u):
     msg = u.get("message") or {}
-    if (msg.get("recipient") or {}).get("chat_type") not in (None, "dialog"):
-        return  # реагируем только на личные сообщения
+    rcp = msg.get("recipient") or {}
+    if rcp.get("chat_type") not in (None, "dialog"):
+        report_chat(rcp.get("chat_id"), rcp.get("chat_type"))
+        return  # на сообщения в каналах и группах не отвечаем
     uid = (msg.get("sender") or {}).get("user_id")
     text = ((msg.get("body") or {}).get("text") or "").strip()
     if not uid:
@@ -590,18 +614,13 @@ def on_message(u):
                 mx.send(f"⚠️ Не получилось: {e}", user_id=uid)
         in_background(job)
     elif text == "/chats":
-        try:
-            chats = mx.call("GET", "/chats").get("chats", [])
-        except Exception as e:  # noqa: BLE001
-            mx.send(f"⚠️ Не удалось получить список: {e}", user_id=uid)
-            return
-        if not chats:
-            mx.send("Бот пока не состоит ни в одном канале. Добавьте его администратором канала.",
-                    user_id=uid)
+        if known_chats:
+            mx.send("Каналы, которые видел бот:\n" + "\n".join(
+                f"• {t}: `{c}`" for c, t in known_chats.items()) +
+                "\n\nЧисло в кавычках впишите в CHANNEL_ID.", user_id=uid)
         else:
-            mx.send("Каналы и чаты бота:\n" + "\n".join(
-                f"• {c.get('title')} ({c.get('type')}): `{c.get('chat_id')}`" for c in chats)
-                + "\n\nЧисло в кавычках впишите в CHANNEL_ID.", user_id=uid)
+            mx.send("Пока не видел ни одного канала. Добавьте бота администратором канала "
+                    "и опубликуйте там любой пост — бот пришлёт ID.", user_id=uid)
     elif text == "/queue":
         rows = q("SELECT * FROM posts WHERE status IN ('pending','approved') ORDER BY id")
         if not rows:
@@ -663,18 +682,9 @@ def scheduler_loop():
 
 def main():
     init_db()
-    try:
-        chats = mx.call("GET", "/chats").get("chats", [])
-        log.info("Чаты и каналы, где состоит бот:")
-        for c in chats:
-            log.info("  CHANNEL_ID=%s  (%s) %s", c.get("chat_id"), c.get("type"), c.get("title"))
-        if not chats:
-            log.warning("  пусто — добавьте бота администратором канала и перезапустите")
-    except Exception as e:  # noqa: BLE001
-        log.warning("Не удалось получить список чатов: %s", e)
     if not CHANNEL_ID:
         log.warning("CHANNEL_ID не задан: черновики будут приходить, но публикация не сработает. "
-                    "Возьмите ID канала из списка выше.")
+                    "Опубликуйте любой пост в канале — бот пришлёт админам его ID.")
     if not ADMIN_IDS:
         log.warning("ADMIN_IDS пуст: напишите боту в личку — он ответит вашим ID")
 
@@ -698,11 +708,9 @@ def main():
                 elif kind == "message_created":
                     on_message(u)
                 elif kind == "bot_added":
-                    cid = u.get("chat_id")
-                    log.info("Бота добавили в чат/канал: CHANNEL_ID=%s", cid)
-                    for a in ADMIN_IDS:
-                        mx.send(f"Меня добавили в канал/чат. Его ID: `{cid}`\n"
-                                "Если это «Идея в кассу», впишите число в CHANNEL_ID.", user_id=a)
+                    report_chat(u.get("chat_id"), "канал" if u.get("is_channel") else "чат")
+                elif kind in ("message_edited", "message_removed", "user_added", "chat_title_changed"):
+                    report_chat(u.get("chat_id") or ((u.get("message") or {}).get("recipient") or {}).get("chat_id"), None)
                 elif kind == "bot_started":
                     uid = (u.get("user") or {}).get("user_id")
                     if uid in ADMIN_IDS:
@@ -716,10 +724,7 @@ def main():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "chats":
-        for c in mx.call("GET", "/chats").get("chats", []):
-            print(f"{c.get('chat_id')}\t{c.get('type')}\t{c.get('title')}")
-    elif cmd == "test":
+    if cmd == "test":
         init_db()
         create_draft(f"manual-{time.time_ns()}", None, 0)
     else:
