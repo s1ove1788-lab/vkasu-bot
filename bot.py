@@ -51,7 +51,7 @@ if _bad:
     sys.exit(f"ADMIN_IDS — только числа через запятую. Непонятно: {', '.join(_bad)}")
 ADMIN_IDS = {int(x) for x in re.split(r"[,\s]+", env("ADMIN_IDS", "")) if x}
 
-GIGACHAT_KEY = env("GIGACHAT_AUTH_KEY")
+GIGACHAT_KEY = re.sub(r"^\s*(Basic\s+)?", "", env("GIGACHAT_AUTH_KEY", "")).strip() or None
 GIGACHAT_SCOPE = env("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 GIGACHAT_MODEL = env("GIGACHAT_MODEL", "GigaChat-2-Pro")
 
@@ -550,6 +550,7 @@ HELP = ("Команды:\n"
         "/new — сделать черновик прямо сейчас (рубрика по кругу)\n"
         "/new 3 — черновик конкретной рубрики (1–5)\n"
         "/queue — что ждёт модерации и публикации\n"
+        "/chats — ID каналов, где состоит бот\n"
         "/cancel — отменить правку текста\n\n"
         "Рубрики:\n" + "\n".join(f"{i}. {r[0]}" for i, r in enumerate(RUBRICS, 1)))
 
@@ -588,6 +589,19 @@ def on_message(u):
             except Exception as e:  # noqa: BLE001
                 mx.send(f"⚠️ Не получилось: {e}", user_id=uid)
         in_background(job)
+    elif text == "/chats":
+        try:
+            chats = mx.call("GET", "/chats").get("chats", [])
+        except Exception as e:  # noqa: BLE001
+            mx.send(f"⚠️ Не удалось получить список: {e}", user_id=uid)
+            return
+        if not chats:
+            mx.send("Бот пока не состоит ни в одном канале. Добавьте его администратором канала.",
+                    user_id=uid)
+        else:
+            mx.send("Каналы и чаты бота:\n" + "\n".join(
+                f"• {c.get('title')} ({c.get('type')}): `{c.get('chat_id')}`" for c in chats)
+                + "\n\nЧисло в кавычках впишите в CHANNEL_ID.", user_id=uid)
     elif text == "/queue":
         rows = q("SELECT * FROM posts WHERE status IN ('pending','approved') ORDER BY id")
         if not rows:
@@ -683,6 +697,12 @@ def main():
                     on_callback(u)
                 elif kind == "message_created":
                     on_message(u)
+                elif kind == "bot_added":
+                    cid = u.get("chat_id")
+                    log.info("Бота добавили в чат/канал: CHANNEL_ID=%s", cid)
+                    for a in ADMIN_IDS:
+                        mx.send(f"Меня добавили в канал/чат. Его ID: `{cid}`\n"
+                                "Если это «Идея в кассу», впишите число в CHANNEL_ID.", user_id=a)
                 elif kind == "bot_started":
                     uid = (u.get("user") or {}).get("user_id")
                     if uid in ADMIN_IDS:
