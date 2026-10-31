@@ -1,0 +1,14 @@
+[Unit]
+Description=Idea v kassu MAX autoposter bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/vkasu-bot
+ExecStart=/opt/vkasu-bot/venv/bin/python /opt/vkasu-bot/bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
