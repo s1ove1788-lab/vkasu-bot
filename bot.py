@@ -28,7 +28,7 @@ import requests
 import feedparser
 from dotenv import load_dotenv
 
-VERSION = "31.10-v7"  # видно в первой строке лога
+VERSION = "31.10-v8"  # видно в первой строке лога
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -326,6 +326,24 @@ class GigaChat:
 
     def __init__(self):
         self.token, self.exp = None, 0
+        self.lock = threading.Lock()  # на личном тарифе GigaChat — один запрос за раз
+
+    def _post(self, payload, timeout):
+        """Запрос к GigaChat по очереди, с повтором при 429 (слишком много запросов)."""
+        with self.lock:
+            for attempt in range(5):
+                if time.time() > self.exp:
+                    self._auth()
+                r = requests.post(self.CHAT, headers={"Authorization": f"Bearer {self.token}"},
+                                  json=payload, verify=CA_BUNDLE, timeout=timeout)
+                if r.status_code == 429 and attempt < 4:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                if r.status_code == 401 and attempt < 4:
+                    self.exp = 0  # токен протух — переавторизуемся
+                    continue
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]
 
     def _auth(self):
         r = requests.post(self.OAUTH, headers={
@@ -342,34 +360,29 @@ class GigaChat:
     def chat(self, system, user, temperature=0.85):
         if not GIGACHAT_KEY:
             raise RuntimeError("Не задан GIGACHAT_AUTH_KEY")
-        if time.time() > self.exp:
-            self._auth()
-        r = requests.post(self.CHAT, headers={"Authorization": f"Bearer {self.token}"}, json={
+        return (self._post({
             "model": GIGACHAT_MODEL,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "temperature": temperature,
-        }, verify=CA_BUNDLE, timeout=120)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        }, timeout=120).get("content") or "").strip()
 
     def draw(self, description):
         """Рисует картинку через Kandinsky (встроен в GigaChat), возвращает байты JPG."""
         if not GIGACHAT_KEY:
             return None
-        if time.time() > self.exp:
-            self._auth()
-        r = requests.post(self.CHAT, headers={"Authorization": f"Bearer {self.token}"}, json={
+        content = self._post({
             "model": GIGACHAT_MODEL,
             "messages": [
-                {"role": "system", "content": "Ты — фотограф и иллюстратор. Рисуешь картинки для постов о бизнесе."},
-                {"role": "user", "content": f"Нарисуй реалистичную фотографию для поста: {description}. "
+                {"role": "system", "content": "Ты — фотограф. Делаешь светлые, приятные фото для постов о малом бизнесе."},
+                {"role": "user", "content": f"Нарисуй реалистичную фотографию на тему: {description}. "
+                                            "Покажи сам бизнес: место, людей за работой, довольных клиентов. "
+                                            "Сцена приятная и аккуратная, еда — только аппетитная. "
+                                            "Никаких насекомых, странных или отталкивающих деталей. "
                                             "Горизонтальный кадр, без текста, надписей и логотипов."},
             ],
             "function_call": "auto",
-        }, verify=CA_BUNDLE, timeout=180)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"].get("content") or ""
+        }, timeout=180).get("content") or ""
         m = re.search(r'<img[^>]+src="([^"]+)"', content)
         if not m:
             log.warning("Kandinsky не нарисовал картинку: %s", content[:150])
@@ -457,7 +470,7 @@ def make_image(text, photo_query, exclude=None):
     for src in IMAGE_SOURCES:
         try:
             if src == "kandinsky":
-                data = giga.draw(f"{title}. Ключевые слова: {photo_query}")
+                data = giga.draw(title or photo_query)
                 if data:
                     return "token:" + mx.upload_image(data)
             elif src in ("pixabay", "pexels"):
