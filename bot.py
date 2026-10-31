@@ -79,6 +79,8 @@ def build_ca_bundle():
             if re.search(r"russian.*\.(cer|crt|pem)$", name, re.I):
                 found.append(os.path.join(folder, name))
     if not found:
+        log.warning("Сертификат Минцифры не найден. Файлы в %s: %s", BASE_DIR,
+                    ", ".join(sorted(os.listdir(BASE_DIR))))
         return True
     import ssl
     import certifi
@@ -561,7 +563,10 @@ def on_message(u):
     if not uid:
         return
     if uid not in ADMIN_IDS:
-        mx.send(f"Ваш ID в MAX: `{uid}`\nЧтобы стать админом бота, добавьте его в ADMIN_IDS.", user_id=uid)
+        if not ADMIN_IDS:  # режим настройки: админы ещё не заданы — подсказываем ID
+            mx.send(f"Ваш ID в MAX: `{uid}`\nВпишите его в ADMIN_IDS и перезапустите бота.", user_id=uid)
+        else:
+            log.info("Посторонний пользователь %s написал боту — игнорирую", uid)
         return
 
     if text == "/cancel":
@@ -680,8 +685,11 @@ def main():
                     on_message(u)
                 elif kind == "bot_started":
                     uid = (u.get("user") or {}).get("user_id")
-                    if uid:
-                        mx.send(f"Привет! Ваш ID в MAX: `{uid}`\n\n{HELP}", user_id=uid)
+                    if uid in ADMIN_IDS:
+                        mx.send(f"Привет! Бот на связи.\n\n{HELP}", user_id=uid)
+                    elif uid and not ADMIN_IDS:
+                        mx.send(f"Ваш ID в MAX: `{uid}`\nВпишите его в ADMIN_IDS и перезапустите бота.",
+                                user_id=uid)
             except Exception as e:  # noqa: BLE001
                 log.exception("Обработка события: %s", e)
 
